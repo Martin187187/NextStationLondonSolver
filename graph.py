@@ -1,11 +1,19 @@
 from __future__ import annotations
 
-from typing import Literal
+from typing import Iterable, Literal, Tuple, Union
 
 
 NodeType = Literal["triangle", "square", "pentagon", "circle", "any"]
 Point = tuple[int, int]
 RegionId = str
+NodeValue = Union[NodeType, Tuple[NodeType, bool]]
+
+
+def _split_node_value(value: NodeValue) -> tuple[NodeType, bool]:
+	if isinstance(value, tuple):
+		node_type, special = value
+		return node_type, bool(special)
+	return value, False
 
 
 def region_for_point(point: Point) -> RegionId:
@@ -84,15 +92,84 @@ def build_8_neighbor_edges(points: set[Point]) -> set[tuple[Point, Point]]:
 	return edges
 
 
+def build_adjacency(edges: set[tuple[Point, Point]]) -> dict[Point, set[Point]]:
+	adj: dict[Point, set[Point]] = {}
+	for a, b in edges:
+		adj.setdefault(a, set()).add(b)
+		adj.setdefault(b, set()).add(a)
+	return adj
+
+
+def normalize_action(action: str) -> NodeType:
+	a = action.strip().lower()
+	synonyms = {
+		"sphere": "circle",
+		"ball": "circle",
+	}
+	a = synonyms.get(a, a)
+	allowed: set[str] = {"triangle", "square", "pentagon", "circle", "any"}
+	if a not in allowed:
+		raise ValueError(f"Unknown action/type: {action!r}. Allowed: {sorted(allowed)}")
+	return a  # type: ignore[return-value]
+
+
+def all_paths_by_actions(
+	*,
+	start: Point,
+	actions: Iterable[str],
+	adjacency: dict[Point, set[Point]],
+	node_types: dict[Point, NodeType],
+	allow_revisit: bool = False,
+) -> list[list[Point]]:
+	"""Return all paths that start at `start` and then follow `actions` by node type.
+
+	For each action (node type), we move to a neighbor whose node type matches.
+	The returned paths include the start node as the first element.
+	"""
+	actions_norm = [normalize_action(a) for a in actions]
+	if start not in node_types:
+		raise ValueError(f"Start node {start} not present in nodes")
+
+	results: list[list[Point]] = []
+
+	def dfs(current: Point, step: int, path: list[Point]) -> None:
+		if step == len(actions_norm):
+			results.append(path.copy())
+			return
+
+		target_type = actions_norm[step]
+		for nxt in sorted(adjacency.get(current, set())):
+			if node_types.get(nxt) != target_type:
+				continue
+			if not allow_revisit and nxt in path:
+				continue
+			path.append(nxt)
+			dfs(nxt, step + 1, path)
+			path.pop()
+
+	dfs(start, 0, [start])
+	return results
+
+
 def main() -> None:
+	# Optional: print all possible paths that match a sequence of node types.
+	# Example:
+	#   START_NODE = (0, 0)
+	#   ACTIONS = ["sphere", "circle"]
+	START_NODE: Point | None =(0, 0)
+	ACTIONS: list[str] = ["sphere", "circle"]
+
 	# Define your nodes here (integer grid coordinates) with their type inline.
 	# Example: (x, y): "triangle". Valid types: triangle, square, pentagon, circle, any
-	nodes: dict[Point, NodeType] = {
+	# You can optionally mark nodes as special:
+	#   (x, y): ("triangle", True)
+	nodes: dict[Point, NodeValue] = {
 		(0, 0): "triangle",
 		(1, 0): "square",
 		(3, 0): "pentagon",
-		(4, 0): "circle",
+		(4, 0): ("circle", True),
 		(5, 0): "triangle",
+		(6, 0): ("any", True),
 		(7, 0): "circle",
 		(9, 0): "square",
 		(1, 1): "circle",
@@ -108,7 +185,7 @@ def main() -> None:
 		(4, 3): "triangle",
 		(6, 3): "square",
 		(7, 3): "triangle",
-		(9, 3): "triangle",
+		(9, 3): ("triangle", True),
 		(0, 4): "pentagon",
 		(2, 4): "square",
 		(4, 4): "circle",
@@ -118,10 +195,10 @@ def main() -> None:
 		(4, 5): "pentagon",
 		(5, 5): "square",
 		(8, 5): "pentagon",
-		(0, 6): "square",
+		(0, 6): ("square", True),
 		(2, 6): "pentagon",
 		(4, 6): "triangle",
-		(5, 6): "any",
+		(5, 6): ("any", True),
 		(6, 6): "circle",
 		(7, 6): "circle",
 		(9, 6): "square",
@@ -131,7 +208,7 @@ def main() -> None:
 		(9, 7): "triangle",
 		(1, 8): "pentagon",
 		(3, 8): "square",
-		(6, 8): "pentagon",
+		(6, 8): ("pentagon", True),
 		(8, 8): "square",
 		(9, 8): "pentagon",
 		(0, 9): "pentagon",
@@ -143,9 +220,32 @@ def main() -> None:
 		(9, 9): "circle",
 	}
 
-	points: set[Point] = set(nodes.keys())
+	node_types: dict[Point, NodeType] = {}
+	special_points: set[Point] = set()
+	for point, value in nodes.items():
+		node_type, special = _split_node_value(value)
+		node_types[point] = node_type
+		if special:
+			special_points.add(point)
+
+	points: set[Point] = set(node_types.keys())
 
 	edges = build_8_neighbor_edges(points)
+	adjacency = build_adjacency(edges)
+
+	if START_NODE is not None and ACTIONS:
+		paths = all_paths_by_actions(
+			start=START_NODE,
+			actions=ACTIONS,
+			adjacency=adjacency,
+			node_types=node_types,
+			allow_revisit=False,
+		)
+		print(f"Start: {START_NODE}")
+		print(f"Actions: {ACTIONS}")
+		print(f"Paths found: {len(paths)}")
+		for path in paths:
+			print(path)
 
 	try:
 		import matplotlib.pyplot as plt
@@ -188,7 +288,7 @@ def main() -> None:
 		"circle": [],
 		"any": [],
 	}
-	for point, point_type in nodes.items():
+	for point, point_type in node_types.items():
 		points_by_type[point_type].append(point)
 
 	# Color nodes by region (13 regions total), keep shape by type.
@@ -213,6 +313,21 @@ def main() -> None:
 			edgecolors="black",
 			linewidths=0.8,
 			zorder=2,
+		)
+
+	# Special nodes: add a simple halo ring overlay
+	if special_points:
+		xs = [x for x, _ in special_points]
+		ys = [y for _, y in special_points]
+		ax.scatter(
+			xs,
+			ys,
+			s=260,
+			marker="o",
+			facecolors="none",
+			edgecolors="black",
+			linewidths=2.0,
+			zorder=3,
 		)
 
 	ax.set_aspect("equal", adjustable="box")
