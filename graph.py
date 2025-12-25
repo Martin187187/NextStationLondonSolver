@@ -310,7 +310,7 @@ def main(*, plot: bool) -> None:
 	CAN_SKIP_ACTION = False
 	FORBID_SELF_INTERSECTIONS = True
 	START_NODE: Optional[Point] = (0, 0)
-	ACTIONS: list[str] = ["circle", "square", "triangle", "circle"]
+	ACTIONS: list[str] = ["circle", "circle", "square", "square", "triangle", "triangle", "pentagon", "pentagon", "any", "any"]
 
 	# Define your nodes here (integer grid coordinates) with their type inline.
 	# Example: (x, y): "triangle". Valid types: triangle, square, pentagon, circle, any
@@ -400,8 +400,12 @@ def main(*, plot: bool) -> None:
 		print(f"Start: {START_NODE}")
 		print(f"Actions: {ACTIONS}")
 		print(f"Paths found: {len(paths)}")
-		for path in paths:
-			print(f"{path} -> score={score_path(path)}")
+
+		TOP_K = 5
+		scored_paths = [(score_path(p), p) for p in paths]
+		scored_paths.sort(key=lambda sp: (-sp[0], sp[1]))
+		for score, path in scored_paths[:TOP_K]:
+			print(f"{path} -> score={score}")
 
 	if not plot:
 		return
