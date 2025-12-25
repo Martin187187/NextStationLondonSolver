@@ -12,6 +12,11 @@ RegionId = str
 NodeValue = Union[NodeType, Tuple[NodeType, bool]]
 
 
+def normalize_edge(a: Point, b: Point) -> tuple[Point, Point]:
+	"""Normalize an undirected edge so (a,b) and (b,a) compare equal."""
+	return (a, b) if a <= b else (b, a)
+
+
 def _split_node_value(value: NodeValue) -> tuple[NodeType, bool]:
 	if isinstance(value, tuple):
 		node_type, special = value
@@ -184,11 +189,17 @@ def path_would_self_intersect(path: list[Point], nxt: Point) -> bool:
 	return False
 
 
-def score_path(path: list[Point]) -> int:
+
+def score_path(
+	path: list[Point],
+	bonus_edges: Optional[dict[tuple[Point, Point], int]] = None,
+) -> int:
 	"""Score a path.
 
-	Score = (# distinct regions visited by the path)
-	        * (maximum number of nodes the path has in any single region).
+	Base score = (# distinct regions visited by the path)
+	             * (maximum number of nodes the path has in any single region).
+
+	If `bonus_edges` is provided, the edge bonus is added on top.
 	"""
 	if not path:
 		return 0
@@ -197,15 +208,68 @@ def score_path(path: list[Point]) -> int:
 	visited_regions = set(regions)
 	counts = Counter(regions)
 	max_visits_in_one_region = max(counts.values())
-	return len(visited_regions) * max_visits_in_one_region
+	base = len(visited_regions) * max_visits_in_one_region
+	return base + edge_bonus_for_path(path, bonus_edges or {})
 
 
-def score_two_paths(path1: list[Point], path2: Optional[list[Point]]) -> int:
-	"""Score the union of visited nodes across both paths."""
+def edge_bonus_for_path(path: list[Point], bonus_edges: dict[tuple[Point, Point], int]) -> int:
+	"""Sum bonus points for edges traversed in `path`.
+
+	Edges are treated as undirected and should be provided normalized via `normalize_edge`.
+	"""
+	if len(path) < 2 or not bonus_edges:
+		return 0
+	bonus = 0
+	for i in range(len(path) - 1):
+		bonus += bonus_edges.get(normalize_edge(path[i], path[i + 1]), 0)
+	return bonus
+
+
+def score_path_with_edge_bonus(path: list[Point], bonus_edges: dict[tuple[Point, Point], int]) -> int:
+	# Backwards-compatible helper; prefer calling `score_path(path, bonus_edges=...)`.
+	return score_path(path, bonus_edges=bonus_edges)
+
+
+def score_two_paths_with_edge_bonus(
+	path1: list[Point],
+	path2: Optional[list[Point]],
+	bonus_edges: dict[tuple[Point, Point], int],
+) -> int:
+	"""Base score (union of visited nodes) + bonus for unique traversed edges across both paths."""
+	base = score_two_paths(path1, path2)
+	if not bonus_edges:
+		return base
+	used_edges: set[tuple[Point, Point]] = set()
+	for path in (path1, path2 or []):
+		for i in range(len(path) - 1):
+			used_edges.add(normalize_edge(path[i], path[i + 1]))
+	bonus = sum(bonus_edges.get(e, 0) for e in used_edges)
+	return base + bonus
+
+
+
+def score_two_paths(
+	path1: list[Point],
+	path2: Optional[list[Point]],
+	bonus_edges: Optional[dict[tuple[Point, Point], int]] = None,
+) -> int:
+	"""Score the union of visited nodes across both paths.
+
+	If `bonus_edges` is provided, the bonus is computed over the unique edges used
+	across both paths (same behavior as `score_two_paths_with_edge_bonus`).
+	"""
 	visited: set[Point] = set(path1)
 	if path2:
 		visited.update(path2)
-	return score_path(list(visited))
+	base = score_path(list(visited))
+	if not bonus_edges:
+		return base
+	used_edges: set[tuple[Point, Point]] = set()
+	for path in (path1, path2 or []):
+		for i in range(len(path) - 1):
+			used_edges.add(normalize_edge(path[i], path[i + 1]))
+	bonus = sum(bonus_edges.get(e, 0) for e in used_edges)
+	return base + bonus
 
 
 def normalize_action(action: str) -> NodeType:
@@ -615,7 +679,37 @@ def main(*, plot: bool) -> None:
 	CAN_SKIP_ACTION = False
 	FORBID_SELF_INTERSECTIONS = True
 	START_NODE: Optional[Point] = (0, 0)
-	ACTIONS: list[str] = ["circle", "square", "pentagon", "pentagon", "any", "junction"]
+	ACTIONS: list[str] = ["square", "square", "pentagon", "pentagon", "triangle", "triangle", "any", "any", "junction"]
+
+	# Hardcode bonus edges here.
+	# Format: {((x1,y1),(x2,y2)): bonus_points, ...}
+	# The edge is treated as undirected; order of endpoints does not matter.
+	BONUS_EDGES: dict[tuple[Point, Point], int] = {
+		((0, 4), (0, 6)): 2,
+		((0, 6), (1, 5)): 2,
+		((1, 8), (1, 5)): 2,
+		((0, 7), (2, 5)): 2,
+		((2, 6), (2, 5)): 2,
+		((2, 5), (4, 5)): 2,
+		((2, 4), (4, 6)): 2,
+		((1, 5), (2, 6)): 2,
+		((3, 3), (3, 7)): 2,
+		((3, 3), (4, 4)): 2,
+		((4, 3), (4, 4)): 2,
+		((4, 3), (7, 6)): 2,
+		((4, 5), (6, 3)): 2,
+		((5, 2), (5, 5)): 2,
+		((5, 5), (7, 3)): 2,
+		((6, 3), (6, 6)): 2,
+		((4, 4), (7, 4)): 2,
+		((5, 6), (7, 4)): 2,
+		((2, 4), (4, 4)): 2,
+		((7, 4), (7, 6)): 2,
+		((6, 6), (9, 3)): 2,
+		((7, 4), (8, 5)): 2,
+		((8, 2), (8, 5)): 2,
+		((9, 3), (9, 6)): 2,
+	}
 
 	# Define your nodes here (integer grid coordinates) with their type inline.
 	# Example: (x, y): "triangle". Valid types: triangle, square, pentagon, circle, any
@@ -627,7 +721,6 @@ def main(*, plot: bool) -> None:
 		(3, 0): "pentagon",
 		(4, 0): ("circle", True),
 		(5, 0): "triangle",
-		(6, 0): ("any", True),
 		(7, 0): "circle",
 		(9, 0): "square",
 		(1, 1): "circle",
@@ -691,6 +784,14 @@ def main(*, plot: bool) -> None:
 	edges = build_8_neighbor_edges(points)
 	adjacency = build_adjacency(edges)
 
+	bonus_edges = {normalize_edge(a, b): pts for (a, b), pts in BONUS_EDGES.items()}
+	unknown_bonus_edges = set(bonus_edges.keys()) - edges
+	if unknown_bonus_edges:
+		print(
+			"Warning: some BONUS_EDGES are not present in the generated graph and will be ignored: "
+			+ ", ".join(map(str, sorted(unknown_bonus_edges)))
+		)
+
 	if START_NODE is not None and ACTIONS:
 		print(f"Start: {START_NODE}")
 		print(f"Actions: {ACTIONS}")
@@ -718,7 +819,10 @@ def main(*, plot: bool) -> None:
 					forbid_self_intersections=FORBID_SELF_INTERSECTIONS,
 				)
 			print(f"Paths found: {len(solutions)}")
-			scored = [(score_two_paths(p1, p2 if p2 else None), p1, p2) for (p1, p2) in solutions]
+			scored = [
+				(score_two_paths(p1, p2 if p2 else None, bonus_edges=bonus_edges), p1, p2)
+				for (p1, p2) in solutions
+			]
 			scored.sort(key=lambda t: (-t[0], t[1], t[2]))
 			for score, p1, p2 in scored[:TOP_K]:
 				print(f"path1={p1} path2={p2} -> score={score}")
@@ -734,7 +838,7 @@ def main(*, plot: bool) -> None:
 				forbid_self_intersections=FORBID_SELF_INTERSECTIONS,
 			)
 			print(f"Paths found: {len(paths)}")
-			scored_paths = [(score_path(p), p) for p in paths]
+			scored_paths = [(score_path(p, bonus_edges=bonus_edges), p) for p in paths]
 			scored_paths.sort(key=lambda sp: (-sp[0], sp[1]))
 			for score, path in scored_paths[:TOP_K]:
 				print(f"{path} -> score={score}")
@@ -763,9 +867,18 @@ def main(*, plot: bool) -> None:
 		ax.axvline(boundary, color="0.85", linewidth=2.0, zorder=0)
 		ax.axhline(boundary, color="0.85", linewidth=2.0, zorder=0)
 
+	bonus_edge_set = set(bonus_edges.keys())
+
 	# Draw edges (grey lines)
 	for (x1, y1), (x2, y2) in edges:
+		if ((x1, y1), (x2, y2)) in bonus_edge_set:
+			continue
 		ax.plot([x1, x2], [y1, y2], color="0.7", linewidth=1.0, zorder=1)
+
+	# Highlight bonus edges on top
+	for (x1, y1), (x2, y2) in sorted(bonus_edge_set & edges):
+		# Keep the same base edge color; emphasize via thickness only.
+		ax.plot([x1, x2], [y1, y2], color="0.7", linewidth=3.0, zorder=1.5)
 
 	# Draw nodes (shape depends on node type)
 	marker_by_type: dict[NodeType, str] = {
