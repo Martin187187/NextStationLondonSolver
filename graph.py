@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Iterable, Literal, Tuple, Union
+import argparse
+from collections import Counter
+from typing import Iterable, Literal, Optional, Tuple, Union
 
 
 NodeType = Literal["triangle", "square", "pentagon", "circle", "any"]
@@ -120,10 +122,14 @@ def all_paths_by_actions(
 	adjacency: dict[Point, set[Point]],
 	node_types: dict[Point, NodeType],
 	allow_revisit: bool = False,
+	order_matters: bool = False,
 ) -> list[list[Point]]:
 	"""Return all paths that start at `start` and then follow `actions` by node type.
 
-	For each action (node type), we move to a neighbor whose node type matches.
+	If `order_matters` is True, actions are consumed in the given order.
+	If `order_matters` is False, actions are matched in any order (multiset).
+
+	For each consumed action (node type), we move to a neighbor whose node type matches.
 	The returned paths include the start node as the first element.
 	"""
 	actions_norm = [normalize_action(a) for a in actions]
@@ -132,32 +138,64 @@ def all_paths_by_actions(
 
 	results: list[list[Point]] = []
 
-	def dfs(current: Point, step: int, path: list[Point]) -> None:
-		if step == len(actions_norm):
+	if order_matters:
+		def dfs_ordered(current: Point, step: int, path: list[Point]) -> None:
+			if step == len(actions_norm):
+				results.append(path.copy())
+				return
+
+			target_type = actions_norm[step]
+			for nxt in sorted(adjacency.get(current, set())):
+				if node_types.get(nxt) != target_type:
+					continue
+				if not allow_revisit and nxt in path:
+					continue
+				path.append(nxt)
+				dfs_ordered(nxt, step + 1, path)
+				path.pop()
+
+		dfs_ordered(start, 0, [start])
+		return results
+
+	remaining = Counter(actions_norm)
+
+	def dfs_unordered(current: Point, remaining_counts: Counter, path: list[Point]) -> None:
+		if not remaining_counts:
 			results.append(path.copy())
 			return
 
-		target_type = actions_norm[step]
 		for nxt in sorted(adjacency.get(current, set())):
-			if node_types.get(nxt) != target_type:
+			nxt_type = node_types.get(nxt)
+			if nxt_type is None:
+				continue
+			if remaining_counts.get(nxt_type, 0) <= 0:
 				continue
 			if not allow_revisit and nxt in path:
 				continue
-			path.append(nxt)
-			dfs(nxt, step + 1, path)
-			path.pop()
 
-	dfs(start, 0, [start])
+			remaining_counts[nxt_type] -= 1
+			if remaining_counts[nxt_type] == 0:
+				del remaining_counts[nxt_type]
+			path.append(nxt)
+			dfs_unordered(nxt, remaining_counts, path)
+			path.pop()
+			remaining_counts[nxt_type] = remaining_counts.get(nxt_type, 0) + 1
+
+	dfs_unordered(start, remaining, [start])
 	return results
 
 
-def main() -> None:
+def main(*, plot: bool) -> None:
 	# Optional: print all possible paths that match a sequence of node types.
 	# Example:
 	#   START_NODE = (0, 0)
 	#   ACTIONS = ["sphere", "circle"]
-	START_NODE: Point | None =(0, 0)
-	ACTIONS: list[str] = ["sphere", "circle"]
+	# Toggle:
+	# - ORDER_MATTERS=True  -> actions must be matched in the given order
+	# - ORDER_MATTERS=False -> actions can be matched in any order
+	ORDER_MATTERS = True
+	START_NODE: Optional[Point] = (0, 0)
+	ACTIONS: list[str] = ["circle", "square"]
 
 	# Define your nodes here (integer grid coordinates) with their type inline.
 	# Example: (x, y): "triangle". Valid types: triangle, square, pentagon, circle, any
@@ -240,12 +278,16 @@ def main() -> None:
 			adjacency=adjacency,
 			node_types=node_types,
 			allow_revisit=False,
+			order_matters=ORDER_MATTERS,
 		)
 		print(f"Start: {START_NODE}")
 		print(f"Actions: {ACTIONS}")
 		print(f"Paths found: {len(paths)}")
 		for path in paths:
 			print(path)
+
+	if not plot:
+		return
 
 	try:
 		import matplotlib.pyplot as plt
@@ -339,4 +381,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-	main()
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--plot", action="store_true", help="Show the matplotlib plot")
+	args = parser.parse_args()
+	main(plot=args.plot)
