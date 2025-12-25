@@ -102,6 +102,86 @@ def build_adjacency(edges: set[tuple[Point, Point]]) -> dict[Point, set[Point]]:
 	return adj
 
 
+def _orientation(a: Point, b: Point, c: Point) -> int:
+	"""Return orientation of (a,b,c): 0 collinear, 1 clockwise, 2 counterclockwise."""
+	ax, ay = a
+	bx, by = b
+	cx, cy = c
+	val = (by - ay) * (cx - bx) - (bx - ax) * (cy - by)
+	if val == 0:
+		return 0
+	return 1 if val > 0 else 2
+
+
+def _on_segment(a: Point, b: Point, c: Point) -> bool:
+	"""True if b lies on segment a-c (assuming collinear)."""
+	ax, ay = a
+	bx, by = b
+	cx, cy = c
+	return min(ax, cx) <= bx <= max(ax, cx) and min(ay, cy) <= by <= max(ay, cy)
+
+
+def segments_intersect(a1: Point, a2: Point, b1: Point, b2: Point) -> bool:
+	"""Return True if segments a1-a2 and b1-b2 intersect (including collinear overlap)."""
+	o1 = _orientation(a1, a2, b1)
+	o2 = _orientation(a1, a2, b2)
+	o3 = _orientation(b1, b2, a1)
+	o4 = _orientation(b1, b2, a2)
+
+	# General case
+	if o1 != o2 and o3 != o4:
+		return True
+
+	# Special cases
+	if o1 == 0 and _on_segment(a1, b1, a2):
+		return True
+	if o2 == 0 and _on_segment(a1, b2, a2):
+		return True
+	if o3 == 0 and _on_segment(b1, a1, b2):
+		return True
+	if o4 == 0 and _on_segment(b1, a2, b2):
+		return True
+
+	return False
+
+
+def path_would_self_intersect(path: list[Point], nxt: Point) -> bool:
+	"""Check if adding edge (path[-1] -> nxt) would make the path self-intersect."""
+	if len(path) < 2:
+		return False
+
+	new_a = path[-1]
+	new_b = nxt
+
+	# Compare against all prior segments except the last one (shares endpoint new_a).
+	for i in range(len(path) - 2):
+		seg_a = path[i]
+		seg_b = path[i + 1]
+		if segments_intersect(new_a, new_b, seg_a, seg_b):
+			# Allow touching only at the shared endpoint new_a.
+			if new_a in (seg_a, seg_b):
+				continue
+			return True
+
+	return False
+
+
+def score_path(path: list[Point]) -> int:
+	"""Score a path.
+
+	Score = (# distinct regions visited by the path)
+	        * (maximum number of nodes the path has in any single region).
+	"""
+	if not path:
+		return 0
+
+	regions = [region_for_point(p) for p in path]
+	visited_regions = set(regions)
+	counts = Counter(regions)
+	max_visits_in_one_region = max(counts.values())
+	return len(visited_regions) * max_visits_in_one_region
+
+
 def normalize_action(action: str) -> NodeType:
 	a = action.strip().lower()
 	synonyms = {
@@ -123,6 +203,8 @@ def all_paths_by_actions(
 	node_types: dict[Point, NodeType],
 	allow_revisit: bool = False,
 	order_matters: bool = False,
+	can_skip_action: bool = False,
+	forbid_self_intersections: bool = True,
 ) -> list[list[Point]]:
 	"""Return all paths that start at `start` and then follow `actions` by node type.
 
@@ -144,11 +226,17 @@ def all_paths_by_actions(
 				results.append(path.copy())
 				return
 
+			# Optionally skip an action (consume it without moving).
+			if can_skip_action:
+				dfs_ordered(current, step + 1, path)
+
 			target_type = actions_norm[step]
 			for nxt in sorted(adjacency.get(current, set())):
 				if node_types.get(nxt) != target_type:
 					continue
 				if not allow_revisit and nxt in path:
+					continue
+				if forbid_self_intersections and path_would_self_intersect(path, nxt):
 					continue
 				path.append(nxt)
 				dfs_ordered(nxt, step + 1, path)
@@ -158,11 +246,32 @@ def all_paths_by_actions(
 		return results
 
 	remaining = Counter(actions_norm)
+	seen_states: set[tuple[Point, tuple[tuple[NodeType, int], ...], tuple[Point, ...]]] = set()
 
 	def dfs_unordered(current: Point, remaining_counts: Counter, path: list[Point]) -> None:
+		state = (current, tuple(sorted(remaining_counts.items())), tuple(path))
+		if state in seen_states:
+			return
+		seen_states.add(state)
+
 		if not remaining_counts:
 			results.append(path.copy())
 			return
+
+		# Optionally skip an action (drop any one remaining required type without moving).
+		if can_skip_action:
+			for t in sorted(list(remaining_counts.keys())):
+				remaining_counts[t] -= 1
+				removed = False
+				if remaining_counts[t] == 0:
+					del remaining_counts[t]
+					removed = True
+				dfs_unordered(current, remaining_counts, path)
+				# restore
+				if removed:
+					remaining_counts[t] = 1
+				else:
+					remaining_counts[t] += 1
 
 		for nxt in sorted(adjacency.get(current, set())):
 			nxt_type = node_types.get(nxt)
@@ -171,6 +280,8 @@ def all_paths_by_actions(
 			if remaining_counts.get(nxt_type, 0) <= 0:
 				continue
 			if not allow_revisit and nxt in path:
+				continue
+			if forbid_self_intersections and path_would_self_intersect(path, nxt):
 				continue
 
 			remaining_counts[nxt_type] -= 1
@@ -193,9 +304,13 @@ def main(*, plot: bool) -> None:
 	# Toggle:
 	# - ORDER_MATTERS=True  -> actions must be matched in the given order
 	# - ORDER_MATTERS=False -> actions can be matched in any order
-	ORDER_MATTERS = True
+	# - CAN_SKIP_ACTION=True -> actions are optional (the solver may skip them)
+	# - FORBID_SELF_INTERSECTIONS=True -> paths whose edges cross are rejected
+	ORDER_MATTERS = False
+	CAN_SKIP_ACTION = False
+	FORBID_SELF_INTERSECTIONS = True
 	START_NODE: Optional[Point] = (0, 0)
-	ACTIONS: list[str] = ["circle", "square"]
+	ACTIONS: list[str] = ["circle", "square", "triangle", "circle"]
 
 	# Define your nodes here (integer grid coordinates) with their type inline.
 	# Example: (x, y): "triangle". Valid types: triangle, square, pentagon, circle, any
@@ -279,12 +394,14 @@ def main(*, plot: bool) -> None:
 			node_types=node_types,
 			allow_revisit=False,
 			order_matters=ORDER_MATTERS,
+			can_skip_action=CAN_SKIP_ACTION,
+			forbid_self_intersections=FORBID_SELF_INTERSECTIONS,
 		)
 		print(f"Start: {START_NODE}")
 		print(f"Actions: {ACTIONS}")
 		print(f"Paths found: {len(paths)}")
 		for path in paths:
-			print(path)
+			print(f"{path} -> score={score_path(path)}")
 
 	if not plot:
 		return
