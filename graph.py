@@ -665,7 +665,7 @@ def all_paths_by_actions(
 	return results
 
 
-def main(*, plot: bool) -> None:
+def main(*, plot: bool, highlight_best: bool) -> None:
 	# Optional: print all possible paths that match a sequence of node types.
 	# Example:
 	#   START_NODE = (0, 0)
@@ -678,7 +678,7 @@ def main(*, plot: bool) -> None:
 	ORDER_MATTERS = False
 	CAN_SKIP_ACTION = False
 	FORBID_SELF_INTERSECTIONS = True
-	START_NODE: Optional[Point] = (0, 0)
+	START_NODE: Optional[Point] = (5, 2)
 	ACTIONS: list[str] = ["square", "square", "pentagon", "pentagon", "triangle", "triangle", "any", "any", "junction"]
 
 	# Hardcode bonus edges here.
@@ -792,6 +792,7 @@ def main(*, plot: bool) -> None:
 			+ ", ".join(map(str, sorted(unknown_bonus_edges)))
 		)
 
+	best_paths: list[list[Point]] = []
 	if START_NODE is not None and ACTIONS:
 		print(f"Start: {START_NODE}")
 		print(f"Actions: {ACTIONS}")
@@ -824,6 +825,9 @@ def main(*, plot: bool) -> None:
 				for (p1, p2) in solutions
 			]
 			scored.sort(key=lambda t: (-t[0], t[1], t[2]))
+			if scored:
+				_, best_p1, best_p2 = scored[0]
+				best_paths = [best_p1] + ([best_p2] if best_p2 else [])
 			for score, p1, p2 in scored[:TOP_K]:
 				print(f"path1={p1} path2={p2} -> score={score}")
 		else:
@@ -840,8 +844,12 @@ def main(*, plot: bool) -> None:
 			print(f"Paths found: {len(paths)}")
 			scored_paths = [(score_path(p, bonus_edges=bonus_edges), p) for p in paths]
 			scored_paths.sort(key=lambda sp: (-sp[0], sp[1]))
+			if scored_paths:
+				best_paths = [scored_paths[0][1]]
 			for score, path in scored_paths[:TOP_K]:
 				print(f"{path} -> score={score}")
+	else:
+		best_paths = []
 
 	if not plot:
 		return
@@ -879,6 +887,16 @@ def main(*, plot: bool) -> None:
 	for (x1, y1), (x2, y2) in sorted(bonus_edge_set & edges):
 		# Keep the same base edge color; emphasize via thickness only.
 		ax.plot([x1, x2], [y1, y2], color="0.7", linewidth=3.0, zorder=1.5)
+
+	# Optionally highlight the best-scoring path(s) (thicker line, same color)
+	if highlight_best and best_paths:
+		for path in best_paths:
+			if len(path) < 2:
+				continue
+			for i in range(len(path) - 1):
+				(x1, y1) = path[i]
+				(x2, y2) = path[i + 1]
+				ax.plot([x1, x2], [y1, y2], color="tab:red", linewidth=5.0, zorder=1.6)
 
 	# Draw nodes (shape depends on node type)
 	marker_by_type: dict[NodeType, str] = {
@@ -949,5 +967,10 @@ def main(*, plot: bool) -> None:
 if __name__ == "__main__":
 	parser = argparse.ArgumentParser()
 	parser.add_argument("--plot", action="store_true", help="Show the matplotlib plot")
+	parser.add_argument(
+		"--highlight-best",
+		action="store_true",
+		help="Overlay the best-scoring path on the plot",
+	)
 	args = parser.parse_args()
-	main(plot=args.plot)
+	main(plot=args.plot, highlight_best=args.highlight_best)
