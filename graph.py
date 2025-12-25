@@ -615,7 +615,7 @@ def main(*, plot: bool) -> None:
 	CAN_SKIP_ACTION = False
 	FORBID_SELF_INTERSECTIONS = True
 	START_NODE: Optional[Point] = (0, 0)
-	ACTIONS: list[str] = ["circle", "square", "pentagon", "any", "circle", "square", "pentagon", "any", "junction"]
+	ACTIONS: list[str] = ["circle", "square", "pentagon", "pentagon", "any", "junction"]
 
 	# Define your nodes here (integer grid coordinates) with their type inline.
 	# Example: (x, y): "triangle". Valid types: triangle, square, pentagon, circle, any
