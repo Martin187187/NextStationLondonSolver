@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from dataclasses import dataclass
+from functools import lru_cache
+import heapq
 from typing import Iterable, Literal, Optional, Tuple, Union
 
 
@@ -665,6 +668,402 @@ def all_paths_by_actions(
 	return results
 
 
+_ACTION_ORDER: tuple[NodeType, ...] = ("triangle", "square", "pentagon", "circle", "any")
+_ACTION_INDEX: dict[NodeType, int] = {t: i for i, t in enumerate(_ACTION_ORDER)}
+
+
+@dataclass(frozen=True)
+class _PrecomputedGraph:
+	points: tuple[Point, ...]
+	point_to_idx: dict[Point, int]
+	node_type_by_idx: tuple[NodeType, ...]
+	adj: tuple[tuple[tuple[int, int], ...], ...]  # per node: ((nbr_idx, edge_idx), ...)
+	edge_points: tuple[tuple[Point, Point], ...]  # edge_idx -> (a_point, b_point) normalized
+	intersect_mask_by_edge: tuple[int, ...]  # edge_idx -> bitmask of conflicting edges
+	bonus_value_by_edge: tuple[int, ...]  # edge_idx -> bonus value
+	bonus_edge_mask: int
+	region_masks: tuple[int, ...]  # region_idx -> bitmask of points in region
+
+
+def _build_precomputed_graph(
+	*,
+	points: set[Point],
+	adjacency: dict[Point, set[Point]],
+	node_types: dict[Point, NodeType],
+	bonus_edges: dict[tuple[Point, Point], int],
+) -> _PrecomputedGraph:
+	idx_points = tuple(sorted(points))
+	point_to_idx = {p: i for i, p in enumerate(idx_points)}
+
+	node_type_by_idx = tuple(node_types[p] for p in idx_points)
+
+	# Edge indexing (normalized, undirected)
+	edges_norm = set()
+	for a, nbrs in adjacency.items():
+		for b in nbrs:
+			edges_norm.add(normalize_edge(a, b))
+	edge_points = tuple(sorted(edges_norm))
+	edge_to_idx = {e: i for i, e in enumerate(edge_points)}
+
+	# Adjacency with edge ids for fast transitions
+	adj_idx: list[list[tuple[int, int]]] = [[] for _ in idx_points]
+	for a in idx_points:
+		ai = point_to_idx[a]
+		for b in adjacency.get(a, set()):
+			bi = point_to_idx[b]
+			ei = edge_to_idx[normalize_edge(a, b)]
+			adj_idx[ai].append((bi, ei))
+	for i in range(len(adj_idx)):
+		adj_idx[i].sort(key=lambda t: (idx_points[t[0]], t[1]))
+	adj = tuple(tuple(v) for v in adj_idx)
+
+	# Precompute disallowed edge intersections.
+	# Two edges conflict if their segments intersect and they do NOT share an endpoint.
+	# Reusing the same undirected segment is also treated as a conflict.
+	conf_masks = [0] * len(edge_points)
+	for i, (a1, a2) in enumerate(edge_points):
+		for j in range(i + 1, len(edge_points)):
+			b1, b2 = edge_points[j]
+			if not segments_intersect(a1, a2, b1, b2):
+				continue
+			# Allow touching at endpoints.
+			if len({a1, a2} & {b1, b2}) > 0:
+				continue
+			conf_masks[i] |= 1 << j
+			conf_masks[j] |= 1 << i
+
+	# Bonus edges mask + per-edge value
+	bonus_value_by_edge = [0] * len(edge_points)
+	bonus_edge_mask = 0
+	for e, pts in bonus_edges.items():
+		ei = edge_to_idx.get(normalize_edge(*e))
+		if ei is None:
+			continue
+		bonus_value_by_edge[ei] = int(pts)
+		bonus_edge_mask |= 1 << ei
+
+	# Regions: build masks for fast base-score from visited bitmask
+	region_ids = sorted({region_for_point(p) for p in idx_points})
+	region_index = {rid: i for i, rid in enumerate(region_ids)}
+	region_masks = [0] * len(region_ids)
+	for p in idx_points:
+		ri = region_index[region_for_point(p)]
+		region_masks[ri] |= 1 << point_to_idx[p]
+
+	return _PrecomputedGraph(
+		points=idx_points,
+		point_to_idx=point_to_idx,
+		node_type_by_idx=node_type_by_idx,
+		adj=adj,
+		edge_points=edge_points,
+		intersect_mask_by_edge=tuple(conf_masks),
+		bonus_value_by_edge=tuple(bonus_value_by_edge),
+		bonus_edge_mask=bonus_edge_mask,
+		region_masks=tuple(region_masks),
+	)
+
+
+def _actions_to_counts(actions: Iterable[str]) -> tuple[int, int, int, int, int]:
+	counts = [0, 0, 0, 0, 0]
+	for a in actions:
+		t = normalize_action(a)
+		counts[_ACTION_INDEX[t]] += 1
+	return (counts[0], counts[1], counts[2], counts[3], counts[4])
+
+
+def _dec_counts(counts: tuple[int, int, int, int, int], idx: int) -> tuple[int, int, int, int, int]:
+	# Small, hot helper; avoid list allocations.
+	if idx == 0:
+		return (counts[0] - 1, counts[1], counts[2], counts[3], counts[4])
+	if idx == 1:
+		return (counts[0], counts[1] - 1, counts[2], counts[3], counts[4])
+	if idx == 2:
+		return (counts[0], counts[1], counts[2] - 1, counts[3], counts[4])
+	if idx == 3:
+		return (counts[0], counts[1], counts[2], counts[3] - 1, counts[4])
+	return (counts[0], counts[1], counts[2], counts[3], counts[4] - 1)
+
+
+def _counts_total(counts: tuple[int, int, int, int, int]) -> int:
+	return counts[0] + counts[1] + counts[2] + counts[3] + counts[4]
+
+
+def _node_matches_action(action_type: NodeType, node_type: NodeType) -> bool:
+	# Mirror action_matches_node(), but inlined for speed.
+	return action_type == "any" or node_type == "any" or action_type == node_type
+
+
+def _popcount(x: int) -> int:
+	"""Return number of set bits in x.
+
+	Compatible with older Python versions that don't have int.bit_count().
+	"""
+	try:
+		return x.bit_count()  # type: ignore[attr-defined]
+	except AttributeError:
+		return bin(x).count("1")
+
+
+def _bonus_sum_for_used_edges(mask: int, bonus_value_by_edge: tuple[int, ...]) -> int:
+	bonus = 0
+	m = mask
+	while m:
+		lsb = m & -m
+		ei = (lsb.bit_length() - 1)
+		bonus += bonus_value_by_edge[ei]
+		m ^= lsb
+	return bonus
+
+
+def _base_score_for_visited(visited_mask: int, region_masks: tuple[int, ...]) -> int:
+	if visited_mask == 0:
+		return 0
+	regions_visited = 0
+	max_in_one = 0
+	for rm in region_masks:
+		c = _popcount(visited_mask & rm)
+		if c:
+			regions_visited += 1
+			if c > max_in_one:
+				max_in_one = c
+	return regions_visited * max_in_one
+
+
+def best_two_path_solutions_unordered_topk(
+	*,
+	start: Point,
+	actions: list[str],
+	adjacency: dict[Point, set[Point]],
+	node_types: dict[Point, NodeType],
+	bonus_edges: dict[tuple[Point, Point], int],
+	allow_revisit: bool = False,
+	can_skip_action: bool = False,
+	forbid_self_intersections: bool = True,
+	top_k: int = 5,
+) -> list[tuple[int, list[Point], list[Point]]]:
+	"""Fast top-K solver for the unordered two-path (single junction) variant.
+
+	This combines pathfinding and scoring, using:
+	- Bitmask states for visited nodes + used edges
+	- Precomputed edge intersection conflicts
+	- Branch-and-bound to avoid enumerating all solutions
+
+	Returns [(score, path1, path2)], where path2 may be [].
+	"""
+	if allow_revisit:
+		# This fast solver is tuned for the default puzzle constraint; fall back to slow enumerator.
+		solutions = all_two_path_solutions_unordered(
+			start=start,
+			actions=actions,
+			adjacency=adjacency,
+			node_types=node_types,
+			allow_revisit=True,
+			can_skip_action=can_skip_action,
+			forbid_self_intersections=forbid_self_intersections,
+		)
+		scored = [
+			(score_two_paths(p1, p2 if p2 else None, bonus_edges=bonus_edges), p1, p2)
+			for (p1, p2) in solutions
+		]
+		scored.sort(key=lambda t: (-t[0], t[1], t[2]))
+		return [(s, p1, p2) for (s, p1, p2) in scored[:top_k]]
+
+	junction_count = sum(1 for a in actions if a.strip().lower() == "junction")
+	if junction_count > 1:
+		raise ValueError("Only one 'junction' action is supported")
+
+	graph = _build_precomputed_graph(
+		points=set(node_types.keys()),
+		adjacency=adjacency,
+		node_types=node_types,
+		bonus_edges=bonus_edges,
+	)
+	if start not in graph.point_to_idx:
+		raise ValueError(f"Start node {start} not present in nodes")
+
+	counts = _actions_to_counts([a for a in actions if a.strip().lower() != "junction"])
+	junction_left = junction_count == 1
+
+	start_idx = graph.point_to_idx[start]
+	start_visited = 1 << start_idx
+
+	max_bonus = max(graph.bonus_value_by_edge) if graph.bonus_value_by_edge else 0
+
+	@lru_cache(maxsize=None)
+	def base_score(visited_mask: int) -> int:
+		return _base_score_for_visited(visited_mask, graph.region_masks)
+
+	@lru_cache(maxsize=None)
+	def bonus_sum(used_edges_mask: int) -> int:
+		return _bonus_sum_for_used_edges(used_edges_mask & graph.bonus_edge_mask, graph.bonus_value_by_edge)
+
+	@lru_cache(maxsize=None)
+	def upper_bound(
+		visited_mask: int,
+		used_edges_mask: int,
+		remaining_counts: tuple[int, int, int, int, int],
+		junction_left_local: bool,
+	) -> int:
+		# Very cheap optimistic bound: assume each remaining move can add a new region
+		# and also add to the current max region occupancy; bonus uses max per move.
+		rem = _counts_total(remaining_counts)
+		if rem == 0 and not junction_left_local:
+			return base_score(visited_mask) + bonus_sum(used_edges_mask)
+		# Compute current region coverage + max occupancy
+		regions_visited = 0
+		max_in_one = 0
+		for rm in graph.region_masks:
+			c = _popcount(visited_mask & rm)
+			if c:
+				regions_visited += 1
+				if c > max_in_one:
+					max_in_one = c
+		regions_max = min(len(graph.region_masks), regions_visited + rem)
+		max_one_max = max_in_one + rem
+		ub_base = regions_max * max_one_max
+		return ub_base + bonus_sum(used_edges_mask) + rem * max_bonus
+
+	# Keep best K in a min-heap of (score, path1_tuple, path2_tuple)
+	heap: list[tuple[int, tuple[Point, ...], tuple[Point, ...]]] = []
+	best_threshold = -10**18
+
+	seen: set[tuple[int, int, int, tuple[int, int, int, int, int], bool, bool]] = set()
+
+	def push_solution(path1: list[int], path2: Optional[list[int]], used_edges_mask: int, visited_mask: int) -> None:
+		nonlocal best_threshold
+		score = base_score(visited_mask) + bonus_sum(used_edges_mask)
+		p1_pts = tuple(graph.points[i] for i in path1)
+		p2_pts = tuple(graph.points[i] for i in (path2 or []))
+		if len(heap) < top_k:
+			heapq.heappush(heap, (score, p1_pts, p2_pts))
+		else:
+			if score <= heap[0][0]:
+				return
+			heapq.heapreplace(heap, (score, p1_pts, p2_pts))
+		best_threshold = heap[0][0]
+
+	def dfs(
+		path1: list[int],
+		path2: Optional[list[int]],
+		used_edges_mask: int,
+		visited_mask: int,
+		remaining_counts: tuple[int, int, int, int, int],
+		junction_left_local: bool,
+		force_next_on_path2: bool,
+	) -> None:
+		nonlocal best_threshold
+
+		# Prune by optimistic bound
+		if len(heap) == top_k:
+			ub = upper_bound(visited_mask, used_edges_mask, remaining_counts, junction_left_local)
+			if ub <= best_threshold:
+				return
+
+		state_key = (
+			path1[-1],
+			path2[-1] if path2 else -1,
+			used_edges_mask,
+			remaining_counts,
+			junction_left_local,
+			force_next_on_path2,
+		)
+		if state_key in seen:
+			return
+		seen.add(state_key)
+
+		if _counts_total(remaining_counts) == 0 and not junction_left_local:
+			push_solution(path1, path2, used_edges_mask, visited_mask)
+			return
+
+		# Optionally skip an action.
+		if can_skip_action:
+			# Skip consumes one remaining type without moving.
+			for ai, c in enumerate(remaining_counts):
+				if c <= 0:
+					continue
+				dfs(
+					path1,
+					path2,
+					used_edges_mask,
+					visited_mask,
+					_dec_counts(remaining_counts, ai),
+					junction_left_local,
+					force_next_on_path2,
+				)
+			if junction_left_local:
+				# Skip junction (consume it with no effect)
+				dfs(path1, path2, used_edges_mask, visited_mask, remaining_counts, False, force_next_on_path2)
+
+		# Consume junction: create path2 from any node visited so far in path1.
+		if junction_left_local and path2 is None:
+			# Only allow join points on path1 (mirrors the original rules)
+			for join_idx in sorted(set(path1)):
+				dfs(path1, [join_idx], used_edges_mask, visited_mask, remaining_counts, False, True)
+
+		# No moves possible if no remaining actions.
+		if _counts_total(remaining_counts) == 0:
+			return
+
+		# Decide which path(s) we are allowed to extend.
+		if path2 is None:
+			allowed_paths = (1,)
+		elif force_next_on_path2:
+			allowed_paths = (2,)
+		else:
+			allowed_paths = (1, 2)
+
+		# Expand in a heuristic order: prefer consuming specific actions before 'any'.
+		action_indices = [0, 1, 2, 3, 4]
+		for ai in action_indices:
+			if remaining_counts[ai] <= 0:
+				continue
+			action_type = _ACTION_ORDER[ai]
+			for which in allowed_paths:
+				current_path = path1 if which == 1 else path2
+				if current_path is None:
+					continue
+				tail = current_path[-1]
+				for nxt, edge_idx in graph.adj[tail]:
+					nxt_type = graph.node_type_by_idx[nxt]
+					if not _node_matches_action(action_type, nxt_type):
+						continue
+					if not allow_revisit:
+						# Disallow visiting any node already used by either path,
+						# except that path2 may start from a path1 node (handled above).
+						if (visited_mask >> nxt) & 1:
+							continue
+					if forbid_self_intersections:
+						if (used_edges_mask >> edge_idx) & 1:
+							continue
+						if (used_edges_mask & graph.intersect_mask_by_edge[edge_idx]) != 0:
+							continue
+
+					next_counts = _dec_counts(remaining_counts, ai)
+					next_used_edges = used_edges_mask | (1 << edge_idx)
+					next_visited = visited_mask | (1 << nxt)
+
+					current_path.append(nxt)
+					next_force = force_next_on_path2
+					if which == 2 and force_next_on_path2:
+						next_force = False
+					dfs(
+						path1,
+						path2,
+						next_used_edges,
+						next_visited,
+						next_counts,
+						junction_left_local,
+						next_force,
+					)
+					current_path.pop()
+
+	dfs([start_idx], None, 0, start_visited, counts, junction_left, False)
+
+	# Emit results sorted like the old printing logic
+	results = sorted(heap, key=lambda t: (-t[0], t[1], t[2]))
+	return [(s, list(p1), list(p2)) for (s, p1, p2) in results]
+
+
 def main(*, plot: bool, highlight_best: bool) -> None:
 	# Optional: print all possible paths that match a sequence of node types.
 	# Example:
@@ -810,21 +1209,19 @@ def main(*, plot: bool, highlight_best: bool) -> None:
 					forbid_self_intersections=FORBID_SELF_INTERSECTIONS,
 				)
 			else:
-				solutions = all_two_path_solutions_unordered(
+				# Fast path: combine search + scoring with pruning (no full enumeration)
+				scored = best_two_path_solutions_unordered_topk(
 					start=START_NODE,
 					actions=ACTIONS,
 					adjacency=adjacency,
 					node_types=node_types,
+					bonus_edges=bonus_edges,
 					allow_revisit=False,
 					can_skip_action=CAN_SKIP_ACTION,
 					forbid_self_intersections=FORBID_SELF_INTERSECTIONS,
+					top_k=TOP_K,
 				)
-			print(f"Paths found: {len(solutions)}")
-			scored = [
-				(score_two_paths(p1, p2 if p2 else None, bonus_edges=bonus_edges), p1, p2)
-				for (p1, p2) in solutions
-			]
-			scored.sort(key=lambda t: (-t[0], t[1], t[2]))
+			print(f"Paths found (top {TOP_K}): {len(scored)}")
 			if scored:
 				_, best_p1, best_p2 = scored[0]
 				best_paths = [best_p1] + ([best_p2] if best_p2 else [])
